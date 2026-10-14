@@ -1,0 +1,23 @@
+node_modules/
+
+# Variables de entorno con secretos (.env.example sí se sube)
+.env
+
+# Base de datos SQLite (dev.db y test.db)
+*.db
+*.db-journal
+
+# Cobertura de pruebas
+coverage/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Configuración local del asistente
+.claude/
+CLAUDE.md
+
+# Presentación (no forma parte del código)
+*.pptx

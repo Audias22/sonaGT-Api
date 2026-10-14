@@ -1,0 +1,157 @@
+// Schema de Prisma para SonaGT API
+// Base de datos: SQLite
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Enums ----------
+
+enum Role {
+  OYENTE
+  ARTISTA
+  ADMIN
+}
+
+enum Plan {
+  FREE
+  PREMIUM
+}
+
+// Eventos que se registran en la bitácora de auditoría
+enum AuditAction {
+  LOGIN_SUCCESS
+  LOGIN_FAILED
+  TOKEN_REUSE_DETECTED
+  LOGOUT
+  PLAN_CHANGED
+  ROLE_CHANGED
+  RESOURCE_DELETED
+  RATE_LIMIT_EXCEEDED
+}
+
+// ---------- Modelos ----------
+
+model User {
+  id        Int      @id @default(autoincrement())
+  name      String
+  email     String   @unique
+  password  String // hash generado con bcrypt
+  role      Role     @default(OYENTE)
+  plan      Plan     @default(FREE)
+  createdAt DateTime @default(now())
+
+  artist        Artist?
+  playlists     Playlist[]
+  playHistory   PlayHistory[]
+  refreshTokens RefreshToken[]
+  auditLogs     AuditLog[]
+}
+
+model Artist {
+  id     Int     @id @default(autoincrement())
+  name   String
+  bio    String?
+  genre  String?
+  userId Int     @unique // @unique garantiza la relación 1 a 1 con User
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  albums Album[]
+  songs  Song[]
+}
+
+model Album {
+  id          Int     @id @default(autoincrement())
+  title       String
+  releaseYear Int
+  coverUrl    String?
+  artistId    Int
+
+  artist Artist @relation(fields: [artistId], references: [id], onDelete: Cascade)
+  songs  Song[]
+}
+
+model Song {
+  id          Int     @id @default(autoincrement())
+  title       String
+  durationSec Int
+  genre       String?
+  audioUrl    String
+  albumId     Int?
+  artistId    Int
+  plays       Int     @default(0)
+
+  album         Album?         @relation(fields: [albumId], references: [id], onDelete: SetNull)
+  artist        Artist         @relation(fields: [artistId], references: [id], onDelete: Cascade)
+  playlistSongs PlaylistSong[]
+  playHistory   PlayHistory[]
+}
+
+model Playlist {
+  id       Int     @id @default(autoincrement())
+  name     String
+  isPublic Boolean @default(false)
+  userId   Int
+
+  user  User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  songs PlaylistSong[]
+}
+
+// Tabla intermedia (muchos a muchos) entre Playlist y Song
+model PlaylistSong {
+  playlistId Int
+  songId     Int
+  addedAt    DateTime @default(now())
+
+  playlist Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  song     Song     @relation(fields: [songId], references: [id], onDelete: Cascade)
+
+  @@id([playlistId, songId]) // una canción no se repite en la misma playlist
+}
+
+model PlayHistory {
+  id       Int      @id @default(autoincrement())
+  userId   Int
+  songId   Int
+  playedAt DateTime @default(now())
+  skipped  Boolean  @default(false) // true si el usuario saltó la canción
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  song Song @relation(fields: [songId], references: [id], onDelete: Cascade)
+
+  // Acelera el conteo de saltos recientes y el historial de cada usuario
+  @@index([userId, playedAt])
+}
+
+model RefreshToken {
+  id        Int      @id @default(autoincrement())
+  token     String   @unique // hash SHA-256 del refresh token (nunca el token en texto plano)
+  userId    Int
+  expiresAt DateTime
+  revoked   Boolean  @default(false)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// Bitácora de auditoría de eventos de seguridad
+model AuditLog {
+  id        Int         @id @default(autoincrement())
+  userId    Int? // usuario que realizó la acción (null si no se conoce, p. ej. login fallido de un email inexistente)
+  action    AuditAction
+  ip        String?
+  userAgent String?
+  details   String? // datos adicionales en formato JSON (nunca contraseñas ni tokens)
+  createdAt DateTime    @default(now())
+
+  // Si se borra el usuario, el registro se conserva con userId = null
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([action])
+  @@index([userId])
+  @@index([createdAt])
+}

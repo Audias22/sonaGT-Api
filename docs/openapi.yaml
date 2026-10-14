@@ -1,0 +1,1877 @@
+openapi: 3.0.3
+
+info:
+  title: SonaGT API
+  version: 1.0.0
+  description: |
+    API REST de **SonaGT**, una plataforma de streaming de música guatemalteca análoga a Spotify
+    (proyecto universitario del curso de Seguridad y Auditoría).
+
+    Permite registrarse, explorar el catálogo de artistas, álbumes y canciones, crear playlists,
+    reproducir y saltar canciones, y administrar usuarios.
+
+    **Autenticación:** inicia sesión en `POST /auth/login`, copia el `accessToken` y pégalo en el
+    botón **Authorize**. El access token dura 15 minutos; renuévalo con `POST /auth/refresh`.
+
+    **Formato de respuestas:**
+    - Éxito: `{ success: true, data, meta? }`
+    - Error: `{ success: false, message, errors }`
+
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Servidor local de desarrollo
+
+tags:
+  - name: Sistema
+    description: Estado del servidor
+  - name: Auth
+    description: Registro, inicio de sesión y manejo de tokens
+  - name: Artistas
+    description: Perfiles de artistas
+  - name: Álbumes
+    description: Álbumes de los artistas
+  - name: Canciones
+    description: Catálogo de canciones
+  - name: Playlists
+    description: Playlists de los usuarios
+  - name: Reproductor
+    description: Reproducciones, saltos e historial
+  - name: Usuarios
+    description: Acciones del usuario autenticado
+  - name: Admin
+    description: Administración (solo rol ADMIN)
+
+# Todas las rutas requieren token salvo las que declaran "security: []"
+security:
+  - bearerAuth: []
+
+paths:
+  # ------------------------------------------------------------------ Sistema
+  /health:
+    get:
+      tags: [Sistema]
+      summary: Verificar que el servidor está activo
+      description: Ruta pública.
+      security: []
+      responses:
+        '200':
+          description: Servidor activo
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+              example: { status: ok }
+
+  # ------------------------------------------------------------------ Auth
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Registrar un usuario
+      description: |
+        Ruta pública. El rol puede ser `OYENTE` (por defecto) o `ARTISTA`; nadie puede registrarse
+        como `ADMIN`. Si el rol es `ARTISTA` se crea también su perfil de artista con el mismo nombre.
+        La contraseña se guarda como hash bcrypt.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+            example:
+              name: Lucía Morales
+              email: lucia@sonagt.test
+              password: Lucia2026
+              role: OYENTE
+      responses:
+        '201':
+          description: Usuario creado (sin contraseña)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/User' }
+              example:
+                success: true
+                data:
+                  id: 13
+                  name: Lucía Morales
+                  email: lucia@sonagt.test
+                  role: OYENTE
+                  plan: FREE
+                  createdAt: '2026-10-14T08:00:00.000Z'
+                  artist: null
+        '400':
+          description: Datos inválidos
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                success: false
+                message: Error de validación
+                errors:
+                  - field: password
+                    message: La contraseña debe tener al menos una mayúscula
+                  - field: role
+                    message: El rol solo puede ser OYENTE o ARTISTA
+        '409':
+          description: El email ya está registrado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                success: false
+                message: El email ya está registrado
+                errors: []
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Iniciar sesión
+      description: |
+        Ruta pública. Devuelve un access token (15 min) y un refresh token (7 días).
+        Si las credenciales son incorrectas responde con un mensaje genérico, sin indicar si falló
+        el email o la contraseña.
+
+        **Rate limit:** máximo 5 intentos cada 15 minutos por IP (configurable con `LOGIN_RATE_LIMIT_MAX`).
+        Los intentos exitosos, fallidos y bloqueados quedan en la bitácora de auditoría.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+            example:
+              email: oyente@sonagt.test
+              password: Oyente2026
+      responses:
+        '200':
+          description: Sesión iniciada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/TokenPair' }
+              example:
+                success: true
+                data:
+                  accessToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI5Iiwicm9sZSI6Ik9ZRU5URSIsInBsYW4iOiJGUkVFIn0.firma
+                  refreshToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI5IiwianRpIjoiLi4uIn0.firma
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: Credenciales inválidas
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                success: false
+                message: Credenciales inválidas
+                errors: []
+        '429':
+          description: Demasiados intentos de inicio de sesión
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                success: false
+                message: Demasiados intentos de inicio de sesión, intenta de nuevo en 15 minutos
+                errors: []
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Renovar tokens (rotación)
+      description: |
+        Ruta pública (usa el refresh token, no el access token). Revoca el refresh token recibido y
+        entrega un par nuevo.
+
+        **Detección de reutilización:** si se envía un refresh token que ya estaba revocado, se
+        cierran TODAS las sesiones activas del usuario y se responde 401.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshTokenRequest' }
+            example:
+              refreshToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI5IiwianRpIjoiLi4uIn0.firma
+      responses:
+        '200':
+          description: Par nuevo de tokens
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/TokenPair' }
+              example:
+                success: true
+                data:
+                  accessToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.nuevo-access.firma
+                  refreshToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.nuevo-refresh.firma
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: Refresh token inválido, vencido o reutilizado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                invalido:
+                  summary: Token inválido o vencido
+                  value:
+                    success: false
+                    message: Refresh token inválido o expirado
+                    errors: []
+                reutilizado:
+                  summary: Token ya revocado (se cierran todas las sesiones)
+                  value:
+                    success: false
+                    message: Se detectó la reutilización de un refresh token; todas las sesiones fueron cerradas
+                    errors: []
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Cerrar sesión
+      description: Ruta pública. Revoca el refresh token recibido. Siempre responde 200 si el body es válido.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshTokenRequest' }
+            example:
+              refreshToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI5IiwianRpIjoiLi4uIn0.firma
+      responses:
+        '200':
+          description: Sesión cerrada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessMessage' }
+              example:
+                success: true
+                message: Sesión cerrada correctamente
+        '400': { $ref: '#/components/responses/ValidationError' }
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Datos del usuario autenticado
+      description: |
+        **Rol:** cualquier usuario autenticado. **Plan:** no aplica.
+        Lee los datos actuales de la base de datos (no del token).
+      responses:
+        '200':
+          description: Usuario autenticado (sin contraseña)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/User' }
+              example:
+                success: true
+                data:
+                  id: 9
+                  name: Ana Pérez
+                  email: oyente@sonagt.test
+                  role: OYENTE
+                  plan: FREE
+                  createdAt: '2026-10-14T07:01:22.598Z'
+                  artist: null
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------ Artistas
+  /artists:
+    get:
+      tags: [Artistas]
+      summary: Listar artistas
+      description: '**Rol:** cualquier usuario autenticado. **Plan:** no aplica.'
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: q
+          in: query
+          description: Búsqueda por nombre (contiene)
+          schema: { type: string, maxLength: 100 }
+          example: cumbia
+        - $ref: '#/components/parameters/Genre'
+      responses:
+        '200':
+          description: Lista paginada de artistas
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ArtistListItem' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+              example:
+                success: true
+                data:
+                  - id: 6
+                    name: Cumbia Volcánica
+                    bio: Grupo de cumbia chapina nacido en Escuintla, a los pies del volcán de Pacaya.
+                    genre: cumbia
+                    _count: { albums: 2, songs: 8 }
+                meta: { page: 1, limit: 10, total: 1, totalPages: 1 }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /artists/me:
+    patch:
+      tags: [Artistas]
+      summary: Editar mi perfil de artista
+      description: |
+        **Rol:** ARTISTA. **Plan:** no aplica.
+        Solo permite cambiar la bio y el género del perfil propio. Debe enviarse al menos un campo.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateArtistRequest' }
+            example:
+              bio: Marimba orquesta de Quetzaltenango con más de 20 años de trayectoria.
+              genre: marimba
+      responses:
+        '200':
+          description: Perfil actualizado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Artist' }
+              example:
+                success: true
+                data:
+                  id: 5
+                  name: Marimba Flor de Xelajú
+                  bio: Marimba orquesta de Quetzaltenango con más de 20 años de trayectoria.
+                  genre: marimba
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /artists/{id}:
+    get:
+      tags: [Artistas]
+      summary: Detalle de un artista con sus álbumes y canciones
+      description: '**Rol:** cualquier usuario autenticado. **Plan:** no aplica.'
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Artista encontrado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/ArtistDetail' }
+              example:
+                success: true
+                data:
+                  id: 6
+                  name: Cumbia Volcánica
+                  bio: Grupo de cumbia chapina nacido en Escuintla, a los pies del volcán de Pacaya.
+                  genre: cumbia
+                  albums:
+                    - id: 10
+                      title: Tropical Chapín
+                      releaseYear: 2023
+                      coverUrl: https://example.com/covers/tropical-chapin.jpg
+                    - id: 9
+                      title: Fuego de Pacaya
+                      releaseYear: 2021
+                      coverUrl: https://example.com/covers/fuego-de-pacaya.jpg
+                  songs:
+                    - id: 31
+                      title: Cumbia Chapina
+                      durationSec: 195
+                      genre: cumbia
+                      audioUrl: https://example.com/audio/cumbia-chapina.mp3
+                      plays: 7410
+                      albumId: 9
+        '400': { $ref: '#/components/responses/InvalidId' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------ Álbumes
+  /albums:
+    post:
+      tags: [Álbumes]
+      summary: Crear un álbum
+      description: |
+        **Rol:** ARTISTA. **Plan:** no aplica.
+        El álbum se asigna automáticamente al perfil del artista autenticado; si el body trae
+        `artistId`, se ignora.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAlbumRequest' }
+            example:
+              title: Noches de Xela
+              releaseYear: 2026
+              coverUrl: https://example.com/covers/noches-de-xela.jpg
+      responses:
+        '201':
+          description: Álbum creado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Album' }
+              example:
+                success: true
+                data:
+                  id: 14
+                  title: Noches de Xela
+                  releaseYear: 2026
+                  coverUrl: https://example.com/covers/noches-de-xela.jpg
+                  artistId: 5
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /albums/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Álbumes]
+      summary: Detalle de un álbum con sus canciones
+      description: '**Rol:** cualquier usuario autenticado. **Plan:** no aplica.'
+      responses:
+        '200':
+          description: Álbum encontrado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/AlbumDetail' }
+              example:
+                success: true
+                data:
+                  id: 9
+                  title: Fuego de Pacaya
+                  releaseYear: 2021
+                  coverUrl: https://example.com/covers/fuego-de-pacaya.jpg
+                  artistId: 6
+                  artist: { id: 6, name: Cumbia Volcánica }
+                  songs:
+                    - id: 30
+                      title: Baila en el Volcán
+                      durationSec: 202
+                      genre: cumbia
+                      audioUrl: https://example.com/audio/baila-en-el-volcan.mp3
+                      plays: 5230
+        '400': { $ref: '#/components/responses/InvalidId' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Álbumes]
+      summary: Editar un álbum
+      description: |
+        **Rol:** ARTISTA dueño del álbum. **Plan:** no aplica.
+        Debe enviarse al menos un campo.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateAlbumRequest' }
+            example:
+              title: Fuego de Pacaya (Edición Deluxe)
+      responses:
+        '200':
+          description: Álbum actualizado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Album' }
+              example:
+                success: true
+                data:
+                  id: 9
+                  title: Fuego de Pacaya (Edición Deluxe)
+                  releaseYear: 2021
+                  coverUrl: https://example.com/covers/fuego-de-pacaya.jpg
+                  artistId: 6
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotOwner' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Álbumes]
+      summary: Eliminar un álbum
+      description: |
+        **Rol:** ARTISTA dueño del álbum o ADMIN. **Plan:** no aplica.
+        Las canciones del álbum no se borran: quedan como sencillos (`album: null`).
+      responses:
+        '200':
+          description: Álbum eliminado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessMessage' }
+              example:
+                success: true
+                message: Álbum eliminado correctamente
+        '400': { $ref: '#/components/responses/InvalidId' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotOwner' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------ Canciones
+  /songs:
+    get:
+      tags: [Canciones]
+      summary: Listar canciones
+      description: '**Rol:** cualquier usuario autenticado. **Plan:** no aplica.'
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: q
+          in: query
+          description: Búsqueda por título (contiene)
+          schema: { type: string, maxLength: 100 }
+          example: lago
+        - $ref: '#/components/parameters/Genre'
+        - name: artistId
+          in: query
+          description: Filtrar por artista
+          schema: { type: integer, minimum: 1 }
+          example: 6
+        - name: sort
+          in: query
+          description: '`popular` ordena por reproducciones (de mayor a menor)'
+          schema: { type: string, enum: [popular] }
+      responses:
+        '200':
+          description: Lista paginada de canciones
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Song' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+              example:
+                success: true
+                data:
+                  - id: 31
+                    title: Cumbia Chapina
+                    durationSec: 195
+                    genre: cumbia
+                    audioUrl: https://example.com/audio/cumbia-chapina.mp3
+                    plays: 7410
+                    artist: { id: 6, name: Cumbia Volcánica }
+                    album:
+                      id: 9
+                      title: Fuego de Pacaya
+                      releaseYear: 2021
+                      coverUrl: https://example.com/covers/fuego-de-pacaya.jpg
+                meta: { page: 1, limit: 1, total: 22, totalPages: 22 }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Canciones]
+      summary: Crear una canción
+      description: |
+        **Rol:** ARTISTA. **Plan:** no aplica.
+        La canción se asigna al perfil del artista autenticado. Si se envía `albumId`, el álbum debe
+        existir (404) y pertenecer al artista (403). `artistId` y `plays` se ignoran.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateSongRequest' }
+            example:
+              title: Atardecer en Panajachel
+              durationSec: 205
+              genre: marimba
+              audioUrl: https://example.com/audio/atardecer-en-panajachel.mp3
+              albumId: 7
+      responses:
+        '201':
+          description: Canción creada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Song' }
+              example:
+                success: true
+                data:
+                  id: 46
+                  title: Atardecer en Panajachel
+                  durationSec: 205
+                  genre: marimba
+                  audioUrl: https://example.com/audio/atardecer-en-panajachel.mp3
+                  plays: 0
+                  artist: { id: 5, name: Marimba Flor de Xelajú }
+                  album:
+                    id: 7
+                    title: Sones de mi Tierra
+                    releaseYear: 2019
+                    coverUrl: https://example.com/covers/sones-de-mi-tierra.jpg
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: El usuario no es ARTISTA o el álbum no es suyo
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                rol:
+                  summary: Rol no permitido
+                  value:
+                    success: false
+                    message: No tienes permiso para realizar esta acción
+                    errors: []
+                albumAjeno:
+                  summary: Álbum de otro artista
+                  value:
+                    success: false
+                    message: El álbum no pertenece a tu perfil de artista
+                    errors: []
+        '404':
+          description: El álbum indicado no existe
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                success: false
+                message: Álbum no encontrado
+                errors: []
+
+  /songs/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Canciones]
+      summary: Detalle de una canción con su artista y álbum
+      description: '**Rol:** cualquier usuario autenticado. **Plan:** no aplica.'
+      responses:
+        '200':
+          description: Canción encontrada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Song' }
+              example:
+                success: true
+                data:
+                  id: 38
+                  title: Cartas desde Petén
+                  durationSec: 256
+                  genre: balada
+                  audioUrl: https://example.com/audio/cartas-desde-peten.mp3
+                  plays: 6120
+                  artist: { id: 7, name: Diego Quetzal }
+                  album:
+                    id: 11
+                    title: Cartas desde Petén
+                    releaseYear: 2018
+                    coverUrl: https://example.com/covers/cartas-desde-peten.jpg
+        '400': { $ref: '#/components/responses/InvalidId' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Canciones]
+      summary: Editar una canción
+      description: |
+        **Rol:** ARTISTA dueño de la canción. **Plan:** no aplica.
+        Debe enviarse al menos un campo. `albumId: null` saca la canción de su álbum; si se indica
+        otro álbum, también debe ser del mismo artista.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateSongRequest' }
+            example:
+              title: Cumbia Chapina (Remix)
+      responses:
+        '200':
+          description: Canción actualizada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Song' }
+              example:
+                success: true
+                data:
+                  id: 31
+                  title: Cumbia Chapina (Remix)
+                  durationSec: 195
+                  genre: cumbia
+                  audioUrl: https://example.com/audio/cumbia-chapina.mp3
+                  plays: 7410
+                  artist: { id: 6, name: Cumbia Volcánica }
+                  album:
+                    id: 9
+                    title: Fuego de Pacaya
+                    releaseYear: 2021
+                    coverUrl: https://example.com/covers/fuego-de-pacaya.jpg
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotOwner' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Canciones]
+      summary: Eliminar una canción
+      description: '**Rol:** ARTISTA dueño de la canción o ADMIN. **Plan:** no aplica.'
+      responses:
+        '200':
+          description: Canción eliminada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessMessage' }
+              example:
+                success: true
+                message: Canción eliminada correctamente
+        '400': { $ref: '#/components/responses/InvalidId' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotOwner' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------ Playlists
+  /playlists:
+    post:
+      tags: [Playlists]
+      summary: Crear una playlist
+      description: |
+        **Rol:** cualquier usuario autenticado.
+        **Plan:** FREE puede tener máximo 3 playlists; PREMIUM no tiene límite.
+        El plan se lee del access token.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreatePlaylistRequest' }
+            example:
+              name: Para el tráfico de la Roosevelt
+              isPublic: true
+      responses:
+        '201':
+          description: Playlist creada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Playlist' }
+              example:
+                success: true
+                data:
+                  id: 5
+                  name: Para el tráfico de la Roosevelt
+                  isPublic: true
+                  userId: 9
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Límite de playlists del plan FREE alcanzado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                success: false
+                message: Límite de playlists del plan FREE alcanzado. Actualiza a PREMIUM
+                errors: []
+
+  /playlists/me:
+    get:
+      tags: [Playlists]
+      summary: Mis playlists
+      description: '**Rol:** cualquier usuario autenticado. **Plan:** no aplica.'
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Lista paginada de mis playlists
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PlaylistListItem' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+              example:
+                success: true
+                data:
+                  - id: 5
+                    name: Para el tráfico de la Roosevelt
+                    isPublic: true
+                    userId: 9
+                    _count: { songs: 2 }
+                meta: { page: 1, limit: 10, total: 1, totalPages: 1 }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /playlists/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Playlists]
+      summary: Detalle de una playlist con sus canciones
+      description: |
+        **Rol:** cualquier usuario autenticado. **Plan:** no aplica.
+        Las canciones vienen ordenadas por `addedAt`. Si la playlist es privada y no es del usuario
+        responde **404** (no 403) para no revelar que existe.
+      responses:
+        '200':
+          description: Playlist encontrada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/PlaylistDetail' }
+              example:
+                success: true
+                data:
+                  id: 5
+                  name: Para el tráfico de la Roosevelt
+                  isPublic: true
+                  userId: 9
+                  owner: { id: 9, name: Ana Pérez }
+                  songs:
+                    - id: 31
+                      title: Cumbia Chapina
+                      durationSec: 195
+                      genre: cumbia
+                      audioUrl: https://example.com/audio/cumbia-chapina.mp3
+                      artist: { id: 6, name: Cumbia Volcánica }
+                      addedAt: '2026-10-14T08:10:11.000Z'
+        '400': { $ref: '#/components/responses/InvalidId' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: No existe o es privada y no es del usuario
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                success: false
+                message: Playlist no encontrada
+                errors: []
+    patch:
+      tags: [Playlists]
+      summary: Editar una playlist
+      description: |
+        **Rol:** dueño de la playlist (cualquier rol). **Plan:** no aplica.
+        Una playlist privada ajena responde 404; una pública ajena, 403.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdatePlaylistRequest' }
+            example:
+              name: Clásicos chapines
+              isPublic: false
+      responses:
+        '200':
+          description: Playlist actualizada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Playlist' }
+              example:
+                success: true
+                data:
+                  id: 5
+                  name: Clásicos chapines
+                  isPublic: false
+                  userId: 9
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotPlaylistOwner' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Playlists]
+      summary: Eliminar una playlist
+      description: |
+        **Rol:** dueño de la playlist (cualquier rol). **Plan:** no aplica.
+        Una playlist privada ajena responde 404; una pública ajena, 403.
+      responses:
+        '200':
+          description: Playlist eliminada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessMessage' }
+              example:
+                success: true
+                message: Playlist eliminada correctamente
+        '400': { $ref: '#/components/responses/InvalidId' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotPlaylistOwner' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /playlists/{id}/songs:
+    post:
+      tags: [Playlists]
+      summary: Agregar una canción a una playlist
+      description: '**Rol:** dueño de la playlist (cualquier rol). **Plan:** no aplica.'
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddSongRequest' }
+            example:
+              songId: 31
+      responses:
+        '201':
+          description: Canción agregada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/PlaylistSong' }
+              example:
+                success: true
+                data:
+                  playlistId: 5
+                  songId: 31
+                  addedAt: '2026-10-14T08:10:11.000Z'
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotPlaylistOwner' }
+        '404':
+          description: La playlist o la canción no existe
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                success: false
+                message: Canción no encontrada
+                errors: []
+        '409':
+          description: La canción ya está en la playlist
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                success: false
+                message: La canción ya está en la playlist
+                errors: []
+
+  /playlists/{id}/songs/{songId}:
+    delete:
+      tags: [Playlists]
+      summary: Quitar una canción de una playlist
+      description: '**Rol:** dueño de la playlist (cualquier rol). **Plan:** no aplica.'
+      parameters:
+        - $ref: '#/components/parameters/Id'
+        - $ref: '#/components/parameters/SongId'
+      responses:
+        '200':
+          description: Canción quitada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessMessage' }
+              example:
+                success: true
+                message: Canción quitada de la playlist
+        '400': { $ref: '#/components/responses/InvalidId' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotPlaylistOwner' }
+        '404':
+          description: La playlist no existe o la canción no está en ella
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                success: false
+                message: La canción no está en la playlist
+                errors: []
+
+  # ------------------------------------------------------------------ Reproductor
+  /player/play/{songId}:
+    post:
+      tags: [Reproductor]
+      summary: Reproducir una canción
+      description: |
+        **Rol:** cualquier usuario autenticado. **Plan:** no aplica.
+        Registra la reproducción en el historial e incrementa `plays` de la canción en una sola
+        transacción.
+      parameters:
+        - $ref: '#/components/parameters/SongId'
+      responses:
+        '201':
+          description: Reproducción registrada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      playedAt: { type: string, format: date-time }
+                      song:
+                        type: object
+                        properties:
+                          id: { type: integer }
+                          title: { type: string }
+                          plays: { type: integer }
+              example:
+                success: true
+                data:
+                  playedAt: '2026-10-14T08:15:00.000Z'
+                  song: { id: 31, title: Cumbia Chapina, plays: 7411 }
+        '400': { $ref: '#/components/responses/InvalidId' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /player/skip/{songId}:
+    post:
+      tags: [Reproductor]
+      summary: Saltar una canción
+      description: |
+        **Rol:** cualquier usuario autenticado.
+        **Plan:** FREE puede saltar máximo 6 canciones por hora; PREMIUM no tiene límite.
+        El plan se lee del access token. Al superar el límite responde 429, indica en `errors` los
+        minutos que faltan y envía la cabecera `Retry-After` (en segundos).
+      parameters:
+        - $ref: '#/components/parameters/SongId'
+      responses:
+        '201':
+          description: Salto registrado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      skippedAt: { type: string, format: date-time }
+                      songId: { type: integer }
+              example:
+                success: true
+                data:
+                  skippedAt: '2026-10-14T08:16:00.000Z'
+                  songId: 30
+        '400': { $ref: '#/components/responses/InvalidId' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429':
+          description: Límite de saltos del plan FREE alcanzado
+          headers:
+            Retry-After:
+              description: Segundos que faltan para poder saltar de nuevo
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                success: false
+                message: Límite de saltos del plan FREE alcanzado. Actualiza a PREMIUM
+                errors:
+                  - field: skip
+                    message: Podrás saltar de nuevo en 42 minuto(s)
+                    retryAfterMinutes: 42
+
+  /player/history:
+    get:
+      tags: [Reproductor]
+      summary: Mi historial de reproducción
+      description: |
+        **Rol:** cualquier usuario autenticado. **Plan:** no aplica.
+        Del más reciente al más antiguo. Incluye reproducciones y saltos (`skipped: true`).
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Historial paginado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PlayHistory' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+              example:
+                success: true
+                data:
+                  - id: 21
+                    playedAt: '2026-10-14T08:15:00.000Z'
+                    skipped: false
+                    song:
+                      id: 31
+                      title: Cumbia Chapina
+                      durationSec: 195
+                      genre: cumbia
+                      artist: { id: 6, name: Cumbia Volcánica }
+                meta: { page: 1, limit: 10, total: 1, totalPages: 1 }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ------------------------------------------------------------------ Usuarios
+  /users/me/plan:
+    patch:
+      tags: [Usuarios]
+      summary: Cambiar mi plan (simulado)
+      description: |
+        **Rol:** cualquier usuario autenticado. **Plan:** no aplica.
+        Simula el cambio de plan sin pago real. Como el plan viaja dentro del JWT, se revocan todos
+        los refresh tokens del usuario y se devuelve un **par nuevo de tokens** con el plan
+        actualizado. El cliente debe reemplazar ambos tokens.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangePlanRequest' }
+            example:
+              plan: PREMIUM
+      responses:
+        '200':
+          description: Plan actualizado y tokens nuevos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    allOf:
+                      - type: object
+                        properties:
+                          user: { $ref: '#/components/schemas/User' }
+                      - $ref: '#/components/schemas/TokenPair'
+              example:
+                success: true
+                data:
+                  user:
+                    id: 9
+                    name: Ana Pérez
+                    email: oyente@sonagt.test
+                    role: OYENTE
+                    plan: PREMIUM
+                  accessToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI5IiwicGxhbiI6IlBSRU1JVU0ifQ.firma
+                  refreshToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.nuevo-refresh.firma
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ------------------------------------------------------------------ Admin
+  /admin/users:
+    get:
+      tags: [Admin]
+      summary: Listar usuarios
+      description: '**Rol:** ADMIN. **Plan:** no aplica. Nunca devuelve contraseñas.'
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: role
+          in: query
+          description: Filtrar por rol
+          schema: { type: string, enum: [OYENTE, ARTISTA, ADMIN] }
+      responses:
+        '200':
+          description: Lista paginada de usuarios
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/User' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+              example:
+                success: true
+                data:
+                  - id: 10
+                    name: Marimba Flor de Xelajú
+                    email: marimba@sonagt.test
+                    role: ARTISTA
+                    plan: FREE
+                    createdAt: '2026-10-14T07:01:22.675Z'
+                meta: { page: 1, limit: 10, total: 3, totalPages: 1 }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/users/{id}/role:
+    patch:
+      tags: [Admin]
+      summary: Cambiar el rol de un usuario
+      description: |
+        **Rol:** ADMIN. **Plan:** no aplica.
+        Un admin no puede quitarse a sí mismo el rol ADMIN (400). Al cambiar el rol se revocan los
+        refresh tokens del usuario. Si pasa a ARTISTA y no tiene perfil, se le crea uno.
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangeRoleRequest' }
+            example:
+              role: ARTISTA
+      responses:
+        '200':
+          description: Rol actualizado
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/User' }
+              example:
+                success: true
+                data:
+                  id: 9
+                  name: Ana Pérez
+                  email: oyente@sonagt.test
+                  role: ARTISTA
+                  plan: FREE
+                  createdAt: '2026-10-14T07:01:22.598Z'
+        '400':
+          description: Datos inválidos o intento de quitarse a sí mismo el rol ADMIN
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                autoDegradacion:
+                  summary: El admin intenta quitarse su propio rol
+                  value:
+                    success: false
+                    message: No puedes quitarte a ti mismo el rol ADMIN
+                    errors: []
+                validacion:
+                  summary: Rol inválido
+                  value:
+                    success: false
+                    message: Error de validación
+                    errors:
+                      - field: role
+                        message: El rol solo puede ser OYENTE, ARTISTA o ADMIN
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /admin/stats:
+    get:
+      tags: [Admin]
+      summary: Estadísticas generales
+      description: |
+        **Rol:** ADMIN. **Plan:** no aplica.
+        Totales de usuarios por rol y por plan, total de canciones, total de reproducciones (suma de
+        `plays`) y las 5 canciones más reproducidas.
+      responses:
+        '200':
+          description: Estadísticas
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Stats' }
+              example:
+                success: true
+                data:
+                  users:
+                    total: 5
+                    byRole: { OYENTE: 1, ARTISTA: 3, ADMIN: 1 }
+                    byPlan: { FREE: 5, PREMIUM: 0 }
+                  totalSongs: 22
+                  totalPlays: 64440
+                  topSongs:
+                    - id: 31
+                      title: Cumbia Chapina
+                      plays: 7410
+                      artist: { id: 6, name: Cumbia Volcánica }
+                    - id: 38
+                      title: Cartas desde Petén
+                      plays: 6120
+                      artist: { id: 7, name: Diego Quetzal }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /admin/audit-logs:
+    get:
+      tags: [Admin]
+      summary: Bitácora de auditoría
+      description: |
+        **Rol:** ADMIN. **Plan:** no aplica.
+        Eventos de seguridad del más reciente al más antiguo. `userId` es el usuario que realizó
+        la acción (en ROLE_CHANGED y RESOURCE_DELETED es el admin). Los registros nunca contienen
+        contraseñas ni tokens.
+
+        Acciones: `LOGIN_SUCCESS`, `LOGIN_FAILED`, `TOKEN_REUSE_DETECTED`, `LOGOUT`,
+        `PLAN_CHANGED`, `ROLE_CHANGED`, `RESOURCE_DELETED`, `RATE_LIMIT_EXCEEDED`.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: action
+          in: query
+          description: Filtrar por tipo de evento
+          schema: { $ref: '#/components/schemas/AuditAction' }
+        - name: userId
+          in: query
+          description: Filtrar por el usuario que realizó la acción
+          schema: { type: integer, minimum: 1 }
+          example: 8
+      responses:
+        '200':
+          description: Lista paginada de eventos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditLog' }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+              example:
+                success: true
+                data:
+                  - id: 42
+                    userId: 8
+                    action: ROLE_CHANGED
+                    ip: '::1'
+                    userAgent: Mozilla/5.0
+                    details: { targetUserId: 12, targetEmail: cantautor@sonagt.test, from: ARTISTA, to: OYENTE }
+                    createdAt: '2026-10-14T09:00:00.000Z'
+                    user: { id: 8, name: Administrador, email: admin@sonagt.test }
+                  - id: 41
+                    userId: null
+                    action: LOGIN_FAILED
+                    ip: '::1'
+                    userAgent: Mozilla/5.0
+                    details: { email: nadie@sonagt.test }
+                    createdAt: '2026-10-14T08:59:00.000Z'
+                    user: null
+                meta: { page: 1, limit: 10, total: 2, totalPages: 1 }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 'Access token obtenido en POST /auth/login (header "Authorization: Bearer <token>")'
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      description: Id numérico (entero positivo)
+      schema: { type: integer, minimum: 1 }
+      example: 31
+    SongId:
+      name: songId
+      in: path
+      required: true
+      description: Id de la canción (entero positivo)
+      schema: { type: integer, minimum: 1 }
+      example: 31
+    Page:
+      name: page
+      in: query
+      description: Número de página
+      schema: { type: integer, minimum: 1, default: 1 }
+    Limit:
+      name: limit
+      in: query
+      description: Elementos por página (máximo 50)
+      schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+    Genre:
+      name: genre
+      in: query
+      description: Filtrar por género (se compara en minúsculas)
+      schema: { type: string }
+      example: cumbia
+
+  responses:
+    ValidationError:
+      description: Error de validación (body, params o query)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            message: Error de validación
+            errors:
+              - field: limit
+                message: limit no puede ser mayor a 50
+    InvalidId:
+      description: El id de la URL no es un entero positivo
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            message: Error de validación
+            errors:
+              - field: id
+                message: El id debe ser un número entero positivo
+    Unauthorized:
+      description: Falta el token, es inválido o expiró
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            sinToken:
+              summary: Sin token
+              value:
+                success: false
+                message: Token no proporcionado
+                errors: []
+            expirado:
+              summary: Token expirado
+              value:
+                success: false
+                message: Token expirado
+                errors: []
+    Forbidden:
+      description: El rol del usuario no tiene permiso
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            message: No tienes permiso para realizar esta acción
+            errors: []
+    NotOwner:
+      description: El rol no tiene permiso o el recurso pertenece a otro artista
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            message: No tienes permiso para modificar este recurso
+            errors: []
+    NotPlaylistOwner:
+      description: La playlist es pública pero pertenece a otro usuario
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            message: No tienes permiso para modificar esta playlist
+            errors: []
+    NotFound:
+      description: El recurso no existe
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            success: false
+            message: Canción no encontrada
+            errors: []
+
+  schemas:
+    # ---------- Formato de respuesta ----------
+    Error:
+      type: object
+      required: [success, message, errors]
+      properties:
+        success: { type: boolean, example: false }
+        message: { type: string, example: Error de validación }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string, example: password }
+              message: { type: string, example: La contraseña debe tener al menos 8 caracteres }
+            additionalProperties: true
+    SuccessMessage:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        message: { type: string }
+    PaginationMeta:
+      type: object
+      properties:
+        page: { type: integer, example: 1 }
+        limit: { type: integer, example: 10 }
+        total: { type: integer, example: 22 }
+        totalPages: { type: integer, example: 3 }
+    TokenPair:
+      type: object
+      properties:
+        accessToken:
+          type: string
+          description: 'JWT con payload { sub, role, plan }; expira en 15 minutos'
+        refreshToken:
+          type: string
+          description: JWT de renovación; expira en 7 días y en la BD se guarda solo su hash SHA-256
+
+    # ---------- Entidades ----------
+    User:
+      type: object
+      properties:
+        id: { type: integer, example: 9 }
+        name: { type: string, example: Ana Pérez }
+        email: { type: string, format: email, example: oyente@sonagt.test }
+        role: { type: string, enum: [OYENTE, ARTISTA, ADMIN] }
+        plan: { type: string, enum: [FREE, PREMIUM] }
+        createdAt: { type: string, format: date-time }
+        artist:
+          description: Perfil de artista (solo en /auth/register y /auth/me)
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/ArtistProfile'
+    ArtistRef:
+      type: object
+      properties:
+        id: { type: integer, example: 6 }
+        name: { type: string, example: Cumbia Volcánica }
+    Artist:
+      type: object
+      properties:
+        id: { type: integer, example: 6 }
+        name: { type: string, example: Cumbia Volcánica }
+        bio: { type: string, nullable: true }
+        genre: { type: string, nullable: true, example: cumbia }
+    ArtistProfile:
+      allOf:
+        - $ref: '#/components/schemas/Artist'
+        - type: object
+          properties:
+            userId: { type: integer, example: 11 }
+    ArtistListItem:
+      allOf:
+        - $ref: '#/components/schemas/Artist'
+        - type: object
+          properties:
+            _count:
+              type: object
+              properties:
+                albums: { type: integer }
+                songs: { type: integer }
+    ArtistDetail:
+      allOf:
+        - $ref: '#/components/schemas/Artist'
+        - type: object
+          properties:
+            albums:
+              type: array
+              items: { $ref: '#/components/schemas/AlbumRef' }
+            songs:
+              type: array
+              items:
+                allOf:
+                  - $ref: '#/components/schemas/SongBase'
+                  - type: object
+                    properties:
+                      albumId: { type: integer, nullable: true }
+    AlbumRef:
+      type: object
+      properties:
+        id: { type: integer, example: 9 }
+        title: { type: string, example: Fuego de Pacaya }
+        releaseYear: { type: integer, example: 2021 }
+        coverUrl: { type: string, format: uri, nullable: true }
+    Album:
+      allOf:
+        - $ref: '#/components/schemas/AlbumRef'
+        - type: object
+          properties:
+            artistId: { type: integer, example: 6 }
+    AlbumDetail:
+      allOf:
+        - $ref: '#/components/schemas/Album'
+        - type: object
+          properties:
+            artist: { $ref: '#/components/schemas/ArtistRef' }
+            songs:
+              type: array
+              items: { $ref: '#/components/schemas/SongBase' }
+    SongBase:
+      type: object
+      properties:
+        id: { type: integer, example: 31 }
+        title: { type: string, example: Cumbia Chapina }
+        durationSec: { type: integer, example: 195 }
+        genre: { type: string, nullable: true, example: cumbia }
+        audioUrl: { type: string, format: uri }
+        plays: { type: integer, example: 7410 }
+    Song:
+      allOf:
+        - $ref: '#/components/schemas/SongBase'
+        - type: object
+          properties:
+            artist: { $ref: '#/components/schemas/ArtistRef' }
+            album:
+              description: null si la canción es un sencillo
+              nullable: true
+              allOf:
+                - $ref: '#/components/schemas/AlbumRef'
+    Playlist:
+      type: object
+      properties:
+        id: { type: integer, example: 5 }
+        name: { type: string, example: Para el tráfico de la Roosevelt }
+        isPublic: { type: boolean, example: true }
+        userId: { type: integer, example: 9 }
+    PlaylistListItem:
+      allOf:
+        - $ref: '#/components/schemas/Playlist'
+        - type: object
+          properties:
+            _count:
+              type: object
+              properties:
+                songs: { type: integer }
+    PlaylistDetail:
+      allOf:
+        - $ref: '#/components/schemas/Playlist'
+        - type: object
+          properties:
+            owner:
+              type: object
+              properties:
+                id: { type: integer }
+                name: { type: string }
+            songs:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: integer }
+                  title: { type: string }
+                  durationSec: { type: integer }
+                  genre: { type: string, nullable: true }
+                  audioUrl: { type: string, format: uri }
+                  artist: { $ref: '#/components/schemas/ArtistRef' }
+                  addedAt: { type: string, format: date-time }
+    PlaylistSong:
+      type: object
+      properties:
+        playlistId: { type: integer }
+        songId: { type: integer }
+        addedAt: { type: string, format: date-time }
+    PlayHistory:
+      type: object
+      properties:
+        id: { type: integer }
+        playedAt: { type: string, format: date-time }
+        skipped: { type: boolean }
+        song:
+          type: object
+          properties:
+            id: { type: integer }
+            title: { type: string }
+            durationSec: { type: integer }
+            genre: { type: string, nullable: true }
+            artist: { $ref: '#/components/schemas/ArtistRef' }
+    Stats:
+      type: object
+      properties:
+        users:
+          type: object
+          properties:
+            total: { type: integer }
+            byRole:
+              type: object
+              properties:
+                OYENTE: { type: integer }
+                ARTISTA: { type: integer }
+                ADMIN: { type: integer }
+            byPlan:
+              type: object
+              properties:
+                FREE: { type: integer }
+                PREMIUM: { type: integer }
+        totalSongs: { type: integer }
+        totalPlays: { type: integer }
+        topSongs:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: integer }
+              title: { type: string }
+              plays: { type: integer }
+              artist: { $ref: '#/components/schemas/ArtistRef' }
+
+    AuditAction:
+      type: string
+      enum:
+        - LOGIN_SUCCESS
+        - LOGIN_FAILED
+        - TOKEN_REUSE_DETECTED
+        - LOGOUT
+        - PLAN_CHANGED
+        - ROLE_CHANGED
+        - RESOURCE_DELETED
+        - RATE_LIMIT_EXCEEDED
+    AuditLog:
+      type: object
+      properties:
+        id: { type: integer }
+        userId:
+          type: integer
+          nullable: true
+          description: Usuario que realizó la acción (null si no se conoce)
+        action: { $ref: '#/components/schemas/AuditAction' }
+        ip: { type: string, nullable: true }
+        userAgent: { type: string, nullable: true }
+        details:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Datos adicionales del evento (se guardan como texto JSON)
+        createdAt: { type: string, format: date-time }
+        user:
+          type: object
+          nullable: true
+          properties:
+            id: { type: integer }
+            name: { type: string }
+            email: { type: string }
+
+    # ---------- Bodies de petición ----------
+    RegisterRequest:
+      type: object
+      required: [name, email, password]
+      properties:
+        name: { type: string, minLength: 2 }
+        email: { type: string, format: email }
+        password:
+          type: string
+          minLength: 8
+          description: Mínimo 8 caracteres, al menos una mayúscula y un número
+        role: { type: string, enum: [OYENTE, ARTISTA], default: OYENTE }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+    RefreshTokenRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken: { type: string }
+    UpdateArtistRequest:
+      type: object
+      minProperties: 1
+      properties:
+        bio: { type: string, maxLength: 500 }
+        genre: { type: string, minLength: 2, maxLength: 30 }
+    CreateAlbumRequest:
+      type: object
+      required: [title, releaseYear]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 100 }
+        releaseYear: { type: integer, minimum: 1900 }
+        coverUrl: { type: string, format: uri, description: Solo http o https }
+    UpdateAlbumRequest:
+      type: object
+      minProperties: 1
+      properties:
+        title: { type: string, minLength: 1, maxLength: 100 }
+        releaseYear: { type: integer, minimum: 1900 }
+        coverUrl: { type: string, format: uri }
+    CreateSongRequest:
+      type: object
+      required: [title, durationSec, audioUrl]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 100 }
+        durationSec: { type: integer, minimum: 1, maximum: 3600 }
+        genre: { type: string, minLength: 2, maxLength: 30 }
+        audioUrl: { type: string, format: uri, description: Solo http o https }
+        albumId: { type: integer, minimum: 1 }
+    UpdateSongRequest:
+      type: object
+      minProperties: 1
+      properties:
+        title: { type: string, minLength: 1, maxLength: 100 }
+        durationSec: { type: integer, minimum: 1, maximum: 3600 }
+        genre: { type: string, minLength: 2, maxLength: 30 }
+        audioUrl: { type: string, format: uri }
+        albumId:
+          type: integer
+          minimum: 1
+          nullable: true
+          description: null para sacar la canción de su álbum
+    CreatePlaylistRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        isPublic: { type: boolean, default: false }
+    UpdatePlaylistRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        isPublic: { type: boolean }
+    AddSongRequest:
+      type: object
+      required: [songId]
+      properties:
+        songId: { type: integer, minimum: 1 }
+    ChangePlanRequest:
+      type: object
+      required: [plan]
+      properties:
+        plan: { type: string, enum: [FREE, PREMIUM] }
+    ChangeRoleRequest:
+      type: object
+      required: [role]
+      properties:
+        role: { type: string, enum: [OYENTE, ARTISTA, ADMIN] }
